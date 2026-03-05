@@ -278,10 +278,11 @@ export default function AgentDetailPage({
         return r.json()
       }),
     ])
-      .then(([agents, c]) => {
+      .then(([agents, cronData]) => {
+        const cronList: CronJob[] = Array.isArray(cronData) ? cronData : cronData.crons ?? []
         setAllAgents(agents)
         setAgent(agents.find((a: Agent) => a.id === id) || null)
-        setCrons(c.filter((cr: CronJob) => cr.agentId === id))
+        setCrons(cronList.filter((cr: CronJob) => cr.agentId === id))
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))

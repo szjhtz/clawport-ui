@@ -166,7 +166,7 @@ export function GlobalSearch() {
         return r.json();
       })
       .then((data: unknown) => {
-        if (Array.isArray(data)) setCrons(data as CronJob[]);
+        setCrons(Array.isArray(data) ? data as CronJob[] : (data as { crons?: CronJob[] })?.crons ?? []);
       })
       .catch(() => setCrons([]));
   }, [open]);

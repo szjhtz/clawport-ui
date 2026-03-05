@@ -138,9 +138,9 @@ export default function HomePage() {
         return r.json()
       }),
     ])
-      .then(([a, c]) => {
+      .then(([a, cronData]) => {
         setAgents(a)
-        setCrons(c)
+        setCrons(Array.isArray(cronData) ? cronData : cronData.crons ?? [])
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))

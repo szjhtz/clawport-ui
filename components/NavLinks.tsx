@@ -72,11 +72,11 @@ export function NavLinks() {
         return r.json();
       })
       .then((data: unknown) => {
-        if (Array.isArray(data)) {
-          const crons = data as CronJob[];
-          setCronCount(crons.length);
-          setCronErrorCount(crons.filter((c) => c.status === 'error').length);
-        }
+        const crons: CronJob[] = Array.isArray(data)
+          ? data
+          : (data as { crons?: CronJob[] })?.crons ?? [];
+        setCronCount(crons.length);
+        setCronErrorCount(crons.filter((c) => c.status === 'error').length);
       })
       .catch(() => {
         setCronErrorCount(null);
