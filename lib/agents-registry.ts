@@ -207,6 +207,9 @@ function discoverAgents(workspacePath: string): AgentEntry[] | null {
 
   // --- Top-level agents ---
   for (const dirName of allAgentDirs) {
+    // Skip if directory name matches the root agent ID (already added above)
+    if (hasRoot && dirName === rootId) continue
+
     const soulFile = join(agentsDir, dirName, 'SOUL.md')
     const hasSoul = existsSync(soulFile)
     const subAgentsDir = join(agentsDir, dirName, 'sub-agents')

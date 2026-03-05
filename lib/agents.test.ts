@@ -593,6 +593,47 @@ describe('auto-discovery from workspace', () => {
     expect(agents[0].reportsTo).toBeNull()
   })
 
+  it('does not duplicate root agent when agents/ dir name matches root ID', async () => {
+    vi.stubEnv('WORKSPACE_PATH', '/tmp/ws')
+
+    // IDENTITY.md says "Jarvis" → rootId = 'jarvis'
+    // agents/jarvis/ directory also exists → should NOT create a second 'jarvis' entry
+    mockExistsSync.mockImplementation((p: string) => {
+      if (p === '/tmp/ws/clawport/agents.json') return false
+      if (p === '/tmp/ws/SOUL.md') return true
+      if (p === '/tmp/ws/IDENTITY.md') return true
+      if (p === '/tmp/ws/agents') return true
+      if (p === '/tmp/ws/agents/jarvis/SOUL.md') return true
+      if (p === '/tmp/ws/agents/jarvis/sub-agents') return false
+      if (p === '/tmp/ws/agents/jarvis/members') return false
+      if (p === '/tmp/ws/agents/vera/SOUL.md') return true
+      if (p === '/tmp/ws/agents/vera/sub-agents') return false
+      if (p === '/tmp/ws/agents/vera/members') return false
+      return false
+    })
+
+    mockReaddirSync.mockReturnValue([
+      { name: 'jarvis', isDirectory: () => true },
+      { name: 'vera', isDirectory: () => true },
+    ])
+
+    mockReadFileSync.mockImplementation((p: string) => {
+      if (p === '/tmp/ws/IDENTITY.md') return '- **Name:** Jarvis\n- **Emoji:** 🤖'
+      if (p === '/tmp/ws/SOUL.md') return '# SOUL.md - Who You Are\nYou are Jarvis.'
+      if (p === '/tmp/ws/agents/jarvis/SOUL.md') return '# SOUL.md — Jarvis\nOrchestrator details.'
+      if (p === '/tmp/ws/agents/vera/SOUL.md') return '# SOUL.md — VERA\nStrategy.'
+      throw new Error('ENOENT')
+    })
+
+    const agents = await getAgents()
+    // Should have exactly 2 agents: jarvis (root) + vera, NOT 3 (no duplicate jarvis)
+    const jarvisEntries = agents.filter(a => a.id === 'jarvis')
+    expect(jarvisEntries).toHaveLength(1)
+    expect(jarvisEntries[0].reportsTo).toBeNull() // it's the root
+    expect(jarvisEntries[0].title).toBe('Orchestrator') // root title, not agent scan
+    expect(agents.find(a => a.id === 'vera')).toBeDefined()
+  })
+
   it('falls back to bundled when no agents/ dir and no root SOUL.md', async () => {
     vi.stubEnv('WORKSPACE_PATH', '/tmp/ws')
     mockExistsSync.mockReturnValue(false)
