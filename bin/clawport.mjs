@@ -150,9 +150,15 @@ ${dim(`Package root: ${PKG_ROOT}`)}
 `)
 }
 
+function portArgs() {
+  const hasPort = extraArgs.some((a) => a === '--port' || a.startsWith('--port=') || a === '-p')
+  if (!hasPort && process.env.PORT) return ['--port', process.env.PORT]
+  return []
+}
+
 function cmdDev() {
   console.log(`\n  ${bold('Starting ClawPort dev server...')}\n`)
-  run(NEXT_BIN, ['dev', ...extraArgs])
+  run(NEXT_BIN, ['dev', ...portArgs(), ...extraArgs])
 }
 
 function cmdStart() {
@@ -164,7 +170,7 @@ function cmdStart() {
   })
   build.on('close', (code) => {
     if (code !== 0) process.exit(code)
-    run(NEXT_BIN, ['start', ...extraArgs])
+    run(NEXT_BIN, ['start', ...portArgs(), ...extraArgs])
   })
 }
 
@@ -286,9 +292,10 @@ async function cmdDoctor() {
   }
   check(workspaceOk, 'Workspace structure', workspaceFix)
 
-  // 7. Port 3000 available
-  const portFree = await checkPort(3000)
-  check(portFree, 'Port 3000 available', 'Port 3000 is in use. Use: clawport dev --port 3001')
+  // 7. Port available
+  const port = Number(process.env.PORT) || 3000
+  const portFree = await checkPort(port)
+  check(portFree, `Port ${port} available`, `Port ${port} is in use. Use: clawport dev --port ${port + 1}`)
 
   // Summary
   console.log()
