@@ -4,51 +4,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import type { Agent, CronJob, CronRun } from "@/lib/types";
 import type { Pipeline } from "@/lib/cron-pipelines";
-import { formatDuration } from "@/lib/cron-utils";
+import { formatDuration, timeAgo, nextRunLabel } from "@/lib/cron-utils";
 import { Skeleton } from "@/components/ui/skeleton";
 import { RefreshCw, BarChart3, Calendar, GitBranch, Copy, Check } from "lucide-react";
 import { ErrorState } from "@/components/ErrorState";
 import { WeeklySchedule } from "@/components/crons/WeeklySchedule";
 import { PipelineGraph } from "@/components/crons/PipelineGraph";
-
-/* ─── Time helpers ──────────────────────────────────────────────── */
-
-function timeAgo(dateStr: string | null): string {
-  if (!dateStr) return "never";
-  const d = new Date(dateStr);
-  if (isNaN(d.getTime())) return "\u2014";
-  const diff = Date.now() - d.getTime();
-  const mins = Math.floor(diff / 60000);
-  const hrs = Math.floor(diff / 3600000);
-  const days = Math.floor(diff / 86400000);
-  if (diff < 0) {
-    const absDiff = Math.abs(diff);
-    const m = Math.floor(absDiff / 60000);
-    const h = Math.floor(absDiff / 3600000);
-    const dy = Math.floor(absDiff / 86400000);
-    if (m < 60) return `in ${m}m`;
-    if (h < 24) return `in ${h}h`;
-    return `in ${dy}d`;
-  }
-  if (mins < 1) return "just now";
-  if (mins < 60) return `${mins}m ago`;
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${days}d ago`;
-}
-
-function nextRunLabel(dateStr: string | null): string {
-  if (!dateStr) return "not scheduled";
-  const d = new Date(dateStr);
-  if (isNaN(d.getTime())) return "\u2014";
-  const diff = d.getTime() - Date.now();
-  if (diff < 0) return "overdue";
-  const mins = Math.floor(diff / 60000);
-  const hrs = Math.floor(diff / 3600000);
-  const days = Math.floor(diff / 86400000);
-  if (mins < 60) return `in ${mins}m`;
-  if (hrs < 24) return `in ${hrs}h`;
-  return `in ${days}d`;
-}
+import { PipelineDetailPanel } from "@/components/crons/PipelineDetailPanel";
+import { PipelineWizard } from "@/components/crons/PipelineWizard";
 
 /* ─── Types ─────────────────────────────────────────────────────── */
 
@@ -439,6 +402,8 @@ export default function CronsPage() {
   const [error, setError] = useState<string | null>(null);
   const [updatedAgo, setUpdatedAgo] = useState("just now");
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [selectedPipelineJob, setSelectedPipelineJob] = useState<string | null>(null);
 
   const pillsRef = useRef<HTMLDivElement>(null);
 
@@ -862,10 +827,45 @@ export default function CronsPage() {
             {tab === "schedule" && <WeeklySchedule crons={crons} />}
 
             {/* ─── PIPELINES TAB ─────────────────────────────── */}
-            {tab === "pipelines" && <PipelineGraph crons={crons} agents={agents} pipelines={pipelines} />}
+            {tab === "pipelines" && (
+              <PipelineGraph
+                crons={crons}
+                agents={agents}
+                pipelines={pipelines}
+                onSetupClick={() => setWizardOpen(true)}
+                onEditClick={() => setWizardOpen(true)}
+                onClearClick={() => {
+                  fetch("/api/pipelines", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify([]),
+                  }).then(() => refresh())
+                }}
+                onJobSelect={setSelectedPipelineJob}
+                selectedJob={selectedPipelineJob}
+              />
+            )}
           </>
         )}
       </div>
+
+      <PipelineWizard
+        open={wizardOpen}
+        onOpenChange={setWizardOpen}
+        agents={agents}
+        crons={crons}
+        onSaved={refresh}
+      />
+
+      {selectedPipelineJob && (
+        <PipelineDetailPanel
+          jobName={selectedPipelineJob}
+          crons={crons}
+          agents={agents}
+          pipelines={pipelines}
+          onClose={() => setSelectedPipelineJob(null)}
+        />
+      )}
 
       <style>{`
         @media (max-width: 640px) {

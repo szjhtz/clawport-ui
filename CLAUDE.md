@@ -5,7 +5,7 @@
 ```bash
 npm run setup        # Auto-detect OpenClaw config, write .env.local
 npm run dev          # Start dev server (Turbopack, port 3000)
-npm test             # Run all 536 tests via Vitest (24 suites)
+npm test             # Run all 612 tests via Vitest (25 suites)
 npx tsc --noEmit     # Type-check (expect 0 errors)
 npx next build       # Production build
 ```
@@ -196,6 +196,26 @@ The widget is mounted in `app/layout.tsx` (global, survives navigation). Three v
 
 **Key files:** `components/LiveStreamWidget.tsx` (widget), `lib/sse.ts` (SSE parser), `app/api/logs/stream/route.ts` (SSE endpoint spawning `openclaw logs --follow --json`)
 
+### Pipeline Health Check & Inline Chat
+
+The Pipelines tab (`PipelineGraph.tsx`) includes an AI health check that analyzes the full cron pipeline system:
+
+```
+"Pipeline Health Check" button
+  -> buildHealthCheckPrompt(crons, pipelines, agents) (lib/pipeline-utils.ts)
+  -> POST /api/chat/${rootAgent.id} (SSE stream)
+  -> Streaming UI: spinner + skeleton -> streamed text with blinking cursor -> "Complete"
+  -> Inline chat appears below results for follow-up questions
+```
+
+**Health check prompt includes:** agent ownership per job (flags UNOWNED jobs), pipeline edges, schedule gaps, missing deliveries, and recommendations.
+
+**Inline chat pattern:** After the health check completes, a chat input appears. Follow-up messages inject the original health check prompt + response as context, then append the conversation history. Uses the same SSE streaming pattern as `PipelineDetailPanel`.
+
+**Clear pipelines:** The "Clear Pipelines" button POSTs `[]` to `/api/pipelines`, resetting to the empty state with the setup wizard.
+
+**Key files:** `components/crons/PipelineGraph.tsx` (UI), `lib/pipeline-utils.ts` (`buildHealthCheckPrompt`, `buildPipelineLayout`), `app/api/pipelines/route.ts` (GET/POST)
+
 ### Theming
 
 Five themes defined via CSS custom properties in `app/globals.css`:
@@ -240,6 +260,8 @@ Used by: `lib/memory.ts`, `lib/cron-runs.ts`, `lib/kanban/chat-store.ts`, `lib/c
 | `/api/costs` | GET | Cost summary computed from cron run token usage |
 | `/api/logs` | GET | Historical log entries (cron runs + config audit) |
 | `/api/logs/stream` | GET | SSE stream of live logs via `openclaw logs --follow --json` |
+| `/api/pipelines` | GET | Load pipeline config from workspace |
+| `/api/pipelines` | POST | Save (or clear) pipeline config -- expects JSON array |
 | `/api/tts` | POST | Text-to-speech via OpenClaw |
 | `/api/transcribe` | POST | Audio transcription via Whisper |
 
@@ -266,6 +288,9 @@ Used by: `lib/memory.ts`, `lib/cron-runs.ts`, `lib/kanban/chat-store.ts`, `lib/c
 | `lib/sanitize.ts` | `renderMarkdown()`, `colorizeJson()`, `escapeHtml()` -- safe HTML rendering |
 | `lib/slash-commands.ts` | Slash command registry, parser (`parseSlashCommand`), matcher (`matchCommands`), executor (`executeCommand`) |
 | `lib/id.ts` | `generateId()` -- UUID generator with fallback for non-secure contexts (HTTP, older browsers) |
+| `lib/pipeline-utils.ts` | Pipeline layout builder, health check prompt builder, cron context builder -- all pure functions |
+| `lib/cron-pipelines.ts` | Pipeline types, `getAllPipelineJobNames()` |
+| `lib/cron-pipelines.server.ts` | `loadPipelines()` -- reads pipeline config from workspace |
 
 ### Chat Components
 
@@ -276,6 +301,15 @@ Used by: `lib/memory.ts`, `lib/cron-runs.ts`, `lib/kanban/chat-store.ts`, `lib/c
 | `FileAttachment.tsx` | File bubble: icon by type + name + size + download |
 | `MediaPreview.tsx` | Pre-send strip of staged attachments with remove buttons |
 | `AgentList.tsx` | Desktop agent sidebar with unread badges |
+
+### Cron & Pipeline Components
+
+| Component | Purpose |
+|-----------|---------|
+| `PipelineGraph.tsx` | React Flow pipeline graph, health check panel with inline chat, standalone crons grid |
+| `PipelineDetailPanel.tsx` | Slide-in panel for individual job details with inline agent chat |
+| `PipelineWizard.tsx` | AI-powered pipeline auto-detection wizard |
+| `WeeklySchedule.tsx` | Weekly schedule heatmap visualization |
 
 ### Other Components
 
@@ -297,7 +331,7 @@ Used by: `lib/memory.ts`, `lib/cron-runs.ts`, `lib/kanban/chat-store.ts`, `lib/c
 
 ## Testing
 
-24 test suites, 536 tests total. All in `lib/` directory.
+25 test suites, 612 tests total. All in `lib/` directory.
 
 ```bash
 npx vitest run                     # All tests
