@@ -1,13 +1,19 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  Agent,
   MemoryFileInfo,
   MemoryConfig,
   MemoryStatus,
   MemoryStats,
   MemoryApiResponse,
   MemoryFileCategory,
+  MemoryHealthSummary,
+  MemoryHealthCheck,
+  HealthSeverity,
+  ReindexStatus,
+  EditingHint,
 } from "@/lib/types";
 import {
   RefreshCw,
@@ -17,16 +23,41 @@ import {
   BarChart3,
   FolderOpen,
   BookOpen,
+  Pencil,
+  Save,
+  X,
+  AlertTriangle,
+  AlertCircle,
+  Info,
+  RotateCw,
+  Activity,
+  MessageSquare,
+  ChevronDown,
+  Zap,
 } from "lucide-react";
 import { renderMarkdown, colorizeJson } from "@/lib/sanitize";
+import { generateId } from "@/lib/id";
 import { timeAgo } from "@/lib/cron-utils";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ErrorState } from "@/components/ErrorState";
+import { computeEditingHints } from "@/lib/memory-hints";
+import { fileHealthSeverity } from "@/lib/memory-health";
+import {
+  buildMemoryHealthPrompt,
+  buildCheckFixPrompt,
+} from "@/lib/memory-health-prompt";
 
 /* ─── Types ──────────────────────────────────────────────────── */
 
 type Tab = "overview" | "browser" | "guide";
 type SortKey = "date" | "name" | "size";
+
+interface HealthChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  isStreaming?: boolean;
+}
 
 const TABS: { key: Tab; label: string; Icon: typeof BarChart3 }[] = [
   { key: "overview", label: "Overview", Icon: BarChart3 },
@@ -1004,6 +1035,407 @@ function CategoryBadge({ category }: { category: MemoryFileCategory }) {
   );
 }
 
+/* ─── Overview: Health Score Card ────────────────────────────── */
+
+function healthScoreColor(score: number): string {
+  if (score >= 80) return "var(--system-green)";
+  if (score >= 60) return "var(--system-orange)";
+  return "var(--system-red)";
+}
+
+function HealthScoreCard({ health }: { health: MemoryHealthSummary }) {
+  const criticals = health.checks.filter((c) => c.severity === "critical").length;
+  const warnings = health.checks.filter((c) => c.severity === "warning").length;
+  const color = healthScoreColor(health.score);
+
+  return (
+    <div
+      style={{
+        background: "var(--material-regular)",
+        border: "1px solid var(--separator)",
+        borderRadius: "var(--radius-md)",
+        padding: "var(--space-4)",
+      }}
+    >
+      <div
+        style={{
+          fontSize: "var(--text-caption1)",
+          color: "var(--text-tertiary)",
+          fontWeight: "var(--weight-medium)",
+          marginBottom: "var(--space-1)",
+        }}
+      >
+        Health
+      </div>
+      <div
+        style={{
+          fontSize: "var(--text-title2)",
+          fontWeight: "var(--weight-bold)",
+          color,
+        }}
+      >
+        {health.score}
+      </div>
+      <div
+        style={{
+          fontSize: "var(--text-caption2)",
+          color: "var(--text-tertiary)",
+          marginTop: 2,
+        }}
+      >
+        {criticals > 0 && (
+          <span style={{ color: "var(--system-red)" }}>
+            {criticals} critical
+          </span>
+        )}
+        {criticals > 0 && warnings > 0 && " \u00b7 "}
+        {warnings > 0 && (
+          <span style={{ color: "var(--system-orange)" }}>
+            {warnings} warning{warnings !== 1 ? "s" : ""}
+          </span>
+        )}
+        {criticals === 0 && warnings === 0 && "All clear"}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Overview: Health Checks List ──────────────────────────── */
+
+const SEVERITY_ICON_MAP: Record<
+  Exclude<HealthSeverity, "ok">,
+  { Icon: typeof AlertTriangle; color: string }
+> = {
+  critical: { Icon: AlertCircle, color: "var(--system-red)" },
+  warning: { Icon: AlertTriangle, color: "var(--system-orange)" },
+  info: { Icon: Info, color: "var(--text-tertiary)" },
+};
+
+function HealthChecksList({
+  checks,
+  onCheckAction,
+  onViewFile,
+  onReindex,
+}: {
+  checks: MemoryHealthCheck[];
+  onCheckAction?: (check: MemoryHealthCheck) => void;
+  onViewFile?: (relativePath: string) => void;
+  onReindex?: () => void;
+}) {
+  if (checks.length === 0) return null;
+
+  return (
+    <div
+      style={{
+        background: "var(--material-regular)",
+        border: "1px solid var(--separator)",
+        borderRadius: "var(--radius-md)",
+        padding: "var(--space-4)",
+      }}
+    >
+      <div
+        style={{
+          fontSize: "var(--text-caption1)",
+          color: "var(--text-tertiary)",
+          fontWeight: "var(--weight-medium)",
+          marginBottom: "var(--space-3)",
+        }}
+      >
+        Health Checks
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+        {checks.map((check) => {
+          const severity = check.severity === "ok" ? "info" : check.severity;
+          const { Icon, color } = SEVERITY_ICON_MAP[severity];
+          const isIndexCheck = check.id === "unindexed-vector" || check.id === "stale-index";
+          return (
+            <div key={check.id} className="flex items-start" style={{ gap: "var(--space-2)" }}>
+              <Icon size={14} style={{ color, flexShrink: 0, marginTop: 2 }} />
+              <div style={{ minWidth: 0, flex: 1 }}>
+                <div
+                  style={{
+                    fontSize: "var(--text-footnote)",
+                    fontWeight: "var(--weight-semibold)",
+                    color: "var(--text-primary)",
+                  }}
+                >
+                  {check.title}
+                </div>
+                <div
+                  style={{
+                    fontSize: "var(--text-caption1)",
+                    color: "var(--text-secondary)",
+                    lineHeight: "var(--leading-relaxed)",
+                    marginTop: 2,
+                  }}
+                >
+                  {check.description}
+                </div>
+                <div
+                  style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: 6,
+                    marginTop: 6,
+                  }}
+                >
+                  {onCheckAction && (
+                    <button
+                      onClick={() => onCheckAction(check)}
+                      className="btn-ghost focus-ring"
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 4,
+                        padding: "3px 10px",
+                        borderRadius: 12,
+                        fontSize: 11,
+                        fontWeight: 600,
+                        background: "var(--fill-secondary)",
+                        border: "1px solid var(--separator)",
+                        color: "var(--accent)",
+                        cursor: "pointer",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      <Zap size={10} />
+                      How to fix
+                    </button>
+                  )}
+                  {check.affectedFiles && check.affectedFiles.length > 0 && onViewFile && (
+                    <button
+                      onClick={() => onViewFile(check.affectedFiles![0])}
+                      className="btn-ghost focus-ring"
+                      style={{
+                        padding: "3px 10px",
+                        borderRadius: 12,
+                        fontSize: 11,
+                        fontWeight: 500,
+                        background: "var(--fill-secondary)",
+                        border: "1px solid var(--separator)",
+                        color: "var(--text-secondary)",
+                        cursor: "pointer",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      View
+                    </button>
+                  )}
+                  {isIndexCheck && onReindex && (
+                    <button
+                      onClick={onReindex}
+                      className="btn-ghost focus-ring"
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: 4,
+                        padding: "3px 10px",
+                        borderRadius: 12,
+                        fontSize: 11,
+                        fontWeight: 500,
+                        background: "var(--fill-secondary)",
+                        border: "1px solid var(--separator)",
+                        color: "var(--text-secondary)",
+                        cursor: "pointer",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      <RotateCw size={10} />
+                      Reindex now
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Overview: Stale Daily Logs Card ───────────────────────── */
+
+function StaleDailyLogsCard({ health }: { health: MemoryHealthSummary }) {
+  const logs = health.staleDailyLogs;
+  if (logs.length === 0) return null;
+
+  const totalSize = logs.reduce((s, l) => s + l.sizeBytes, 0);
+
+  return (
+    <div
+      style={{
+        background: "var(--material-regular)",
+        border: "1px solid var(--separator)",
+        borderRadius: "var(--radius-md)",
+        padding: "var(--space-4)",
+      }}
+    >
+      <div
+        style={{
+          fontSize: "var(--text-caption1)",
+          color: "var(--text-tertiary)",
+          fontWeight: "var(--weight-medium)",
+          marginBottom: "var(--space-3)",
+        }}
+      >
+        Stale Daily Logs ({logs.length})
+      </div>
+      <div
+        style={{
+          fontSize: "var(--text-caption1)",
+          color: "var(--text-secondary)",
+          marginBottom: "var(--space-3)",
+          lineHeight: "var(--leading-relaxed)",
+        }}
+      >
+        {logs.length} daily log{logs.length !== 1 ? "s" : ""} older than 30 days ({formatBytes(totalSize)} total).
+        Review for patterns worth promoting to evergreen files, then delete the rest.
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-1)" }}>
+        {logs.slice(0, 10).map((log) => (
+          <div
+            key={log.relativePath}
+            className="flex items-center justify-between"
+            style={{
+              padding: "var(--space-1) var(--space-2)",
+              borderRadius: "var(--radius-sm)",
+              fontSize: "var(--text-caption2)",
+            }}
+          >
+            <span className="font-mono" style={{ color: "var(--text-secondary)" }}>
+              {log.date}
+            </span>
+            <span style={{ color: "var(--text-tertiary)" }}>
+              {log.ageDays}d {"\u00b7"} {formatBytes(log.sizeBytes)}
+            </span>
+          </div>
+        ))}
+        {logs.length > 10 && (
+          <div
+            style={{
+              fontSize: "var(--text-caption2)",
+              color: "var(--text-tertiary)",
+              padding: "var(--space-1) var(--space-2)",
+            }}
+          >
+            +{logs.length - 10} more
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Browser: Health Badge ─────────────────────────────────── */
+
+const HEALTH_BADGE_COLORS: Record<HealthSeverity, string | null> = {
+  critical: "var(--system-red)",
+  warning: "var(--system-orange)",
+  info: "var(--text-tertiary)",
+  ok: null,
+};
+
+function HealthBadge({ severity }: { severity: HealthSeverity }) {
+  const color = HEALTH_BADGE_COLORS[severity];
+  if (!color) return null;
+
+  return (
+    <span
+      style={{
+        width: 6,
+        height: 6,
+        borderRadius: "50%",
+        background: color,
+        flexShrink: 0,
+      }}
+      title={`Health: ${severity}`}
+    />
+  );
+}
+
+/* ─── Browser: Reindex Button ───────────────────────────────── */
+
+function ReindexButton({
+  status,
+  onReindex,
+}: {
+  status: ReindexStatus;
+  onReindex: () => void;
+}) {
+  if (status === "unavailable") return null;
+
+  const isRunning = status === "running";
+  const isSuccess = status === "success";
+
+  return (
+    <button
+      onClick={onReindex}
+      disabled={isRunning}
+      className="btn-ghost focus-ring"
+      style={{
+        padding: "6px 12px",
+        borderRadius: "var(--radius-sm)",
+        fontSize: "var(--text-caption1)",
+        fontWeight: "var(--weight-medium)",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 4,
+        color: isSuccess ? "var(--system-green)" : undefined,
+        cursor: isRunning ? "not-allowed" : "pointer",
+        opacity: isRunning ? 0.6 : 1,
+      }}
+    >
+      <RotateCw
+        size={14}
+        style={{
+          animation: isRunning ? "spin 1s linear infinite" : undefined,
+        }}
+      />
+      {isRunning ? "Reindexing..." : isSuccess ? "Done" : "Reindex"}
+    </button>
+  );
+}
+
+/* ─── Browser: Editing Hints Panel ──────────────────────────── */
+
+const HINT_BORDER_COLORS: Record<EditingHint["severity"], string> = {
+  warning: "var(--system-orange)",
+  tip: "var(--text-tertiary)",
+};
+
+function EditingHintsPanel({ hints }: { hints: EditingHint[] }) {
+  if (hints.length === 0) return null;
+
+  return (
+    <div
+      style={{
+        marginTop: "var(--space-3)",
+        display: "flex",
+        flexDirection: "column",
+        gap: "var(--space-2)",
+      }}
+    >
+      {hints.map((hint) => (
+        <div
+          key={hint.id}
+          style={{
+            borderLeft: `3px solid ${HINT_BORDER_COLORS[hint.severity]}`,
+            paddingLeft: "var(--space-3)",
+            paddingTop: "var(--space-1)",
+            paddingBottom: "var(--space-1)",
+            fontSize: "var(--text-caption1)",
+            color: "var(--text-secondary)",
+            lineHeight: "var(--leading-relaxed)",
+          }}
+        >
+          {hint.text}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /* ─── Main Component ─────────────────────────────────────────── */
 
 export default function MemoryPage() {
@@ -1020,8 +1452,39 @@ export default function MemoryPage() {
   const [copied, setCopied] = useState(false);
   const [mobileShowContent, setMobileShowContent] = useState(false);
 
+  // Health & hints state
+  const [health, setHealth] = useState<MemoryHealthSummary | null>(null);
+  const [reindexStatus, setReindexStatus] = useState<ReindexStatus>("idle");
+  const [editingHints, setEditingHints] = useState<EditingHint[]>([]);
+  const [showReindex, setShowReindex] = useState(false);
+
+  // Editing state
+  const [editingContent, setEditingContent] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [pendingFile, setPendingFile] = useState<MemoryFileInfo | null>(null);
+
+  // AI Memory Advisor state
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [analysisOpen, setAnalysisOpen] = useState(false);
+  const [analysisStreaming, setAnalysisStreaming] = useState(false);
+  const [analysisContent, setAnalysisContent] = useState("");
+  const chatTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const [chatMessages, setChatMessages] = useState<HealthChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatStreaming, setChatStreaming] = useState(false);
+
+  const isEditing = editingContent !== null;
+  const isDirty = editingContent !== null && editingContent !== selected?.content;
+
+  const rootAgent = useMemo(
+    () => agents.find((a) => a.reportsTo === null) || agents[0] || null,
+    [agents],
+  );
+
   const listRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -1044,11 +1507,13 @@ export default function MemoryPage() {
           setConfig(null);
           setStatus(null);
           setStats(null);
+          setHealth(null);
         } else {
           setFiles(data.files);
           setConfig(data.config);
           setStatus(data.status);
           setStats(data.stats);
+          setHealth(data.health);
         }
         setLoading(false);
       })
@@ -1062,6 +1527,14 @@ export default function MemoryPage() {
     refresh();
   }, [refresh]);
 
+  // Fetch agents for AI advisor
+  useEffect(() => {
+    fetch("/api/agents")
+      .then((r) => r.json())
+      .then(setAgents)
+      .catch(() => {});
+  }, []);
+
   // Auto-select first file when switching to browser tab with no selection
   useEffect(() => {
     if (tab === "browser" && !selected && files.length > 0) {
@@ -1069,12 +1542,245 @@ export default function MemoryPage() {
     }
   }, [tab, selected, files]);
 
+  /* Debounced editing hints */
+  useEffect(() => {
+    if (!isEditing || !selected || editingContent === null) {
+      setEditingHints([]);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setEditingHints(computeEditingHints(selected, editingContent, config));
+    }, 500);
+
+    return () => clearTimeout(timer);
+  }, [editingContent, selected, config, isEditing]);
+
+  /* Reset showReindex on file switch or entering edit mode */
+  useEffect(() => {
+    setShowReindex(false);
+  }, [selected, isEditing]);
+
+  /* Reindex handler */
+  async function handleReindex() {
+    setReindexStatus("running");
+    try {
+      const res = await fetch("/api/memory/reindex", { method: "POST" });
+      const data = await res.json();
+      if (res.status === 503) {
+        setReindexStatus("unavailable");
+      } else if (data.status === "success") {
+        setReindexStatus("success");
+        // Refresh data to pick up new index status
+        setTimeout(() => refresh(), 1000);
+      } else {
+        setReindexStatus("failed");
+      }
+    } catch {
+      setReindexStatus("failed");
+    }
+  }
+
+  /* ─── AI Memory Advisor callbacks ─────────────────────────── */
+
+  const runAnalysis = useCallback(async () => {
+    if (!rootAgent || analysisStreaming || !config || !status || !stats || !health) return;
+    setAnalysisOpen(true);
+    setAnalysisStreaming(true);
+    setAnalysisContent("");
+    setChatMessages([]);
+
+    const prompt = buildMemoryHealthPrompt(files, config, status, stats, health);
+
+    try {
+      const res = await fetch(`/api/chat/${rootAgent.id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: [{ role: "user", content: prompt }] }),
+      });
+      if (!res.ok || !res.body) throw new Error("Stream failed");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let fullContent = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (line.startsWith("data: ") && line !== "data: [DONE]") {
+            try {
+              const chunk = JSON.parse(line.slice(6));
+              if (chunk.content) {
+                fullContent += chunk.content;
+                setAnalysisContent(fullContent);
+              }
+            } catch {
+              /* skip */
+            }
+          }
+        }
+      }
+    } catch {
+      setAnalysisContent(
+        (prev) => prev + "\n\n[Error: Failed to connect to agent]",
+      );
+    } finally {
+      setAnalysisStreaming(false);
+    }
+  }, [rootAgent, analysisStreaming, files, config, status, stats, health]);
+
+  const sendChatMessage = useCallback(
+    async (overrideText?: string) => {
+      const text = (overrideText ?? chatInput).trim();
+      if (!text || chatStreaming || !rootAgent || !config || !status || !stats || !health) return;
+      if (!overrideText) setChatInput("");
+
+      const userMsg: HealthChatMessage = {
+        id: generateId(),
+        role: "user",
+        content: text,
+      };
+      const assistantMsgId = generateId();
+      const assistantMsg: HealthChatMessage = {
+        id: assistantMsgId,
+        role: "assistant",
+        content: "",
+        isStreaming: true,
+      };
+
+      setChatMessages((prev) => [...prev, userMsg, assistantMsg]);
+      setChatStreaming(true);
+
+      const prompt = buildMemoryHealthPrompt(files, config, status, stats, health);
+      const allMessages = [...chatMessages, userMsg];
+      const apiMessages = [
+        { role: "user" as const, content: prompt },
+        ...(analysisContent
+          ? [{ role: "assistant" as const, content: analysisContent }]
+          : []),
+        ...allMessages.map((m) => ({ role: m.role, content: m.content })),
+      ];
+
+      try {
+        const res = await fetch(`/api/chat/${rootAgent.id}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: apiMessages }),
+        });
+        if (!res.ok || !res.body) throw new Error("Stream failed");
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let fullContent = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) {
+            if (line.startsWith("data: ") && line !== "data: [DONE]") {
+              try {
+                const chunk = JSON.parse(line.slice(6));
+                if (chunk.content) {
+                  fullContent += chunk.content;
+                  const captured = fullContent;
+                  setChatMessages((prev) =>
+                    prev.map((m) =>
+                      m.id === assistantMsgId
+                        ? { ...m, content: captured, isStreaming: true }
+                        : m,
+                    ),
+                  );
+                }
+              } catch {
+                /* skip */
+              }
+            }
+          }
+        }
+
+        const finalContent = fullContent;
+        setChatMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId
+              ? { ...m, content: finalContent, isStreaming: false }
+              : m,
+          ),
+        );
+      } catch {
+        setChatMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMsgId
+              ? {
+                  ...m,
+                  content: "Error getting response. Check API connection.",
+                  isStreaming: false,
+                }
+              : m,
+          ),
+        );
+      } finally {
+        setChatStreaming(false);
+        chatTextareaRef.current?.focus();
+      }
+    },
+    [chatInput, chatStreaming, rootAgent, chatMessages, analysisContent, files, config, status, stats, health],
+  );
+
+  const handleCheckAction = useCallback(
+    (check: MemoryHealthCheck) => {
+      if (!analysisOpen) setAnalysisOpen(true);
+      const prompt = buildCheckFixPrompt(check, files);
+      if (!analysisContent && !analysisStreaming) {
+        runAnalysis();
+        return;
+      }
+      sendChatMessage(prompt);
+    },
+    [analysisOpen, analysisContent, analysisStreaming, runAnalysis, sendChatMessage, files],
+  );
+
+  const handleViewFile = useCallback(
+    (relativePath: string) => {
+      const file = files.find((f) => f.relativePath === relativePath);
+      if (file) {
+        setSelected(file);
+        setTab("browser");
+      }
+    },
+    [files],
+  );
+
+  /* Content match count for search badges */
+  function contentMatchCount(content: string, query: string): number {
+    if (!query) return 0;
+    const q = query.toLowerCase();
+    const text = content.toLowerCase();
+    let count = 0;
+    let idx = 0;
+    while ((idx = text.indexOf(q, idx)) !== -1) {
+      count++;
+      idx += q.length;
+    }
+    return count;
+  }
+
   /* Sorted + filtered files */
+  const q = search.toLowerCase();
   const sortedFiles = [...files]
     .filter(
       (f) =>
-        f.label.toLowerCase().includes(search.toLowerCase()) ||
-        f.relativePath.toLowerCase().includes(search.toLowerCase())
+        f.label.toLowerCase().includes(q) ||
+        f.relativePath.toLowerCase().includes(q) ||
+        f.content.toLowerCase().includes(q)
     )
     .sort((a, b) => {
       if (sort === "name") return a.label.localeCompare(b.label);
@@ -1144,9 +1850,109 @@ export default function MemoryPage() {
 
   /* Select file and show content on mobile */
   function selectFile(file: MemoryFileInfo) {
+    if (isDirty) {
+      setPendingFile(file);
+      return;
+    }
+    setEditingContent(null);
+    setSaveError(null);
     setSelected(file);
     setMobileShowContent(true);
   }
+
+  /* Discard edits and switch to pending file */
+  function discardAndSwitch() {
+    const file = pendingFile;
+    setEditingContent(null);
+    setSaveError(null);
+    setPendingFile(null);
+    if (file) {
+      setSelected(file);
+      setMobileShowContent(true);
+    }
+  }
+
+  /* Enter edit mode */
+  function startEditing() {
+    if (!selected) return;
+    setEditingContent(selected.content);
+    setSaveError(null);
+  }
+
+  /* Cancel editing */
+  function cancelEditing() {
+    setEditingContent(null);
+    setSaveError(null);
+  }
+
+  /* Save edited content */
+  async function saveContent() {
+    if (!selected || editingContent === null) return;
+
+    // JSON validation for .json files
+    if (isJsonFile(selected)) {
+      try {
+        JSON.parse(editingContent);
+      } catch {
+        setSaveError("Invalid JSON syntax");
+        return;
+      }
+    }
+
+    setSaving(true);
+    setSaveError(null);
+
+    try {
+      const res = await fetch("/api/memory", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          relativePath: selected.relativePath,
+          content: editingContent,
+          expectedLastModified: selected.lastModified,
+        }),
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: "Save failed" }));
+        setSaveError(data.error || `Save failed (${res.status})`);
+        return;
+      }
+
+      const data = await res.json();
+
+      // Update local state with new content/metadata
+      const updated: MemoryFileInfo = {
+        ...selected,
+        content: editingContent,
+        lastModified: data.lastModified,
+        sizeBytes: data.sizeBytes,
+      };
+      setFiles((prev) =>
+        prev.map((f) => (f.path === selected.path ? updated : f))
+      );
+      setSelected(updated);
+      setEditingContent(null);
+      // Show reindex button if vector search is enabled
+      if (config?.memorySearch.enabled) {
+        setShowReindex(true);
+        setReindexStatus("idle");
+      }
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /* When editing ends and there's a pending file, switch to it */
+  useEffect(() => {
+    if (!isEditing && pendingFile) {
+      setSelected(pendingFile);
+      setMobileShowContent(true);
+      setPendingFile(null);
+    }
+  }, [isEditing, pendingFile]);
 
   /* Computed for selected file */
   const isJson = selected ? isJsonFile(selected) : false;
@@ -1159,6 +1965,22 @@ export default function MemoryPage() {
     return <ErrorState message={error} onRetry={refresh} />;
   }
 
+  /* ─── Search highlighting helper ─────────────────────────── */
+  function highlightMatches(html: string, query: string): string {
+    if (!query) return html;
+    // Escape special regex characters in query
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`(${escaped})`, "gi");
+    // Only highlight text outside of HTML tags
+    return html.replace(/(<[^>]*>)|([^<]+)/g, (_, tag, text) => {
+      if (tag) return tag;
+      return text.replace(
+        re,
+        '<mark style="background:var(--accent);opacity:0.25;color:inherit;border-radius:2px;padding:0 1px">$1</mark>'
+      );
+    });
+  }
+
   /* ─── Rendered content (for browser tab) ─────────────────── */
   let renderedContent: React.ReactNode = null;
   if (selected) {
@@ -1166,6 +1988,8 @@ export default function MemoryPage() {
       try {
         const pretty = JSON.stringify(JSON.parse(selected.content), null, 2);
         const lines = pretty.split("\n");
+        const colorized = colorizeJson(pretty);
+        const highlighted = search ? highlightMatches(colorized, search) : colorized;
         renderedContent = (
           <div
             style={{
@@ -1210,7 +2034,7 @@ export default function MemoryPage() {
                   margin: 0,
                 }}
                 dangerouslySetInnerHTML={{
-                  __html: colorizeJson(pretty),
+                  __html: highlighted,
                 }}
               />
             </div>
@@ -1241,6 +2065,8 @@ export default function MemoryPage() {
         );
       }
     } else {
+      const md = renderMarkdown(selected.content);
+      const highlighted = search ? highlightMatches(md, search) : md;
       renderedContent = (
         <div
           style={{
@@ -1249,12 +2075,22 @@ export default function MemoryPage() {
             color: "var(--text-secondary)",
           }}
           dangerouslySetInnerHTML={{
-            __html: `<p class="mb-3" style="color:var(--text-secondary)">${renderMarkdown(selected.content)}</p>`,
+            __html: `<p class="mb-3" style="color:var(--text-secondary)">${highlighted}</p>`,
           }}
         />
       );
     }
   }
+
+  /* Scroll to first match when opening a file from search */
+  useEffect(() => {
+    if (search && selected && contentRef.current) {
+      const mark = contentRef.current.querySelector("mark");
+      if (mark) {
+        setTimeout(() => mark.scrollIntoView({ behavior: "smooth", block: "center" }), 100);
+      }
+    }
+  }, [selected, search]);
 
   return (
     <div
@@ -1382,12 +2218,13 @@ export default function MemoryPage() {
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "1fr 1fr 1fr",
+                gridTemplateColumns: "repeat(4, 1fr)",
                 gap: "var(--space-3)",
                 marginBottom: "var(--space-4)",
               }}
+              className="overview-cards-grid"
             >
-              {[1, 2, 3].map((i) => (
+              {[1, 2, 3, 4].map((i) => (
                 <div
                   key={i}
                   style={{
@@ -1426,7 +2263,7 @@ export default function MemoryPage() {
                 <div
                   style={{
                     display: "grid",
-                    gridTemplateColumns: "repeat(3, 1fr)",
+                    gridTemplateColumns: "repeat(4, 1fr)",
                     gap: "var(--space-3)",
                     marginBottom: "var(--space-4)",
                   }}
@@ -1435,12 +2272,298 @@ export default function MemoryPage() {
                   <FilesCard stats={stats!} />
                   <SizeCard stats={stats!} />
                   <IndexCard status={status!} />
+                  {health && <HealthScoreCard health={health} />}
                 </div>
 
                 {/* Timeline */}
                 {stats && (
                   <div style={{ marginBottom: "var(--space-4)" }}>
                     <MemoryTimeline timeline={stats.dailyTimeline} />
+                  </div>
+                )}
+
+                {/* Health checks */}
+                {health && health.checks.length > 0 && (
+                  <div style={{ marginBottom: "var(--space-4)" }}>
+                    <HealthChecksList
+                      checks={health.checks}
+                      onCheckAction={rootAgent ? handleCheckAction : undefined}
+                      onViewFile={handleViewFile}
+                      onReindex={handleReindex}
+                    />
+                  </div>
+                )}
+
+                {/* Memory Advisor */}
+                {rootAgent && config && status && stats && health && (
+                  <div style={{
+                    background: "var(--material-regular)",
+                    border: "1px solid var(--separator)",
+                    borderRadius: 12,
+                    marginBottom: "var(--space-4)",
+                    overflow: "hidden",
+                  }}>
+                    {/* Header */}
+                    <div style={{
+                      padding: "16px 20px",
+                      display: "flex", alignItems: "center", gap: 12,
+                      borderBottom: analysisOpen ? "1px solid var(--separator)" : undefined,
+                    }}>
+                      <Activity size={18} style={{ color: "var(--accent)", flexShrink: 0 }} />
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>
+                          Memory Advisor
+                        </div>
+                        <div style={{ fontSize: 12, color: "var(--text-tertiary)", marginTop: 2 }}>
+                          AI-powered analysis of your memory system health
+                        </div>
+                      </div>
+                      {analysisStreaming && (
+                        <span style={{
+                          display: "inline-flex", alignItems: "center", gap: 6,
+                          fontSize: 12, color: "var(--accent)", fontWeight: 500,
+                        }}>
+                          <span style={{
+                            width: 6, height: 6, borderRadius: "50%", background: "var(--accent)",
+                            animation: "pulse 1.2s infinite",
+                          }} />
+                          Analyzing...
+                        </span>
+                      )}
+                      {!analysisOpen && !analysisContent && !analysisStreaming && (
+                        <button
+                          onClick={() => { setAnalysisOpen(true); runAnalysis(); }}
+                          className="btn-ghost focus-ring"
+                          style={{
+                            padding: "6px 16px", borderRadius: 8,
+                            fontSize: 13, fontWeight: 600,
+                            background: "var(--accent)", color: "white",
+                            border: "none", cursor: "pointer",
+                          }}
+                        >
+                          Analyze
+                        </button>
+                      )}
+                      {(analysisOpen || analysisContent) && (
+                        <button
+                          onClick={() => setAnalysisOpen(!analysisOpen)}
+                          className="focus-ring"
+                          style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}
+                        >
+                          <ChevronDown
+                            size={16}
+                            style={{
+                              color: "var(--text-tertiary)",
+                              transform: analysisOpen ? "rotate(180deg)" : "rotate(0deg)",
+                              transition: "transform 200ms ease",
+                            }}
+                          />
+                        </button>
+                      )}
+                    </div>
+
+                    {analysisOpen && (
+                      <div>
+                        {/* Loading skeleton */}
+                        {analysisStreaming && !analysisContent && (
+                          <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 10 }}>
+                            {[180, 240, 160, 220, 140].map((w, i) => (
+                              <div key={i} style={{
+                                width: w, maxWidth: "100%", height: 12, borderRadius: 4,
+                                background: "var(--fill-tertiary)",
+                                animation: `shimmer 1.6s ease-in-out ${i * 0.15}s infinite`,
+                              }} />
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Analysis content */}
+                        {analysisContent && (
+                          <div
+                            className="markdown-body"
+                            style={{
+                              padding: "16px 20px",
+                              maxHeight: 520,
+                              overflowY: "auto",
+                              fontSize: 14,
+                              lineHeight: 1.65,
+                              color: "var(--text-primary)",
+                            }}
+                            dangerouslySetInnerHTML={{ __html: renderMarkdown(analysisContent) }}
+                          />
+                        )}
+
+                        {/* Suggested actions (before first analysis) */}
+                        {!analysisContent && !analysisStreaming && (
+                          <div style={{ padding: "12px 20px 16px" }}>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>
+                              Ask about
+                            </div>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                              {[
+                                "What should I fix first and why?",
+                                "How do I reorganize MEMORY.md?",
+                                "Walk me through cleaning up old daily logs",
+                                "Is my memory system set up correctly?",
+                              ].map((q) => (
+                                <button
+                                  key={q}
+                                  onClick={() => { setAnalysisOpen(true); runAnalysis(); }}
+                                  className="btn-ghost focus-ring"
+                                  style={{
+                                    padding: "5px 12px", borderRadius: 14,
+                                    fontSize: 12, fontWeight: 500,
+                                    background: "var(--fill-secondary)",
+                                    border: "1px solid var(--separator)",
+                                    color: "var(--text-secondary)",
+                                    cursor: "pointer",
+                                    whiteSpace: "nowrap",
+                                  }}
+                                >
+                                  {q}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Inline chat (after analysis complete) */}
+                        {analysisContent && !analysisStreaming && (
+                          <>
+                            <div style={{ height: 1, background: "var(--separator)" }} />
+
+                            {/* Chat messages */}
+                            {chatMessages.length > 0 && (
+                              <div style={{ maxHeight: 320, overflowY: "auto", padding: "12px 20px" }}>
+                                {chatMessages.map((msg) => (
+                                  <div key={msg.id} style={{
+                                    marginBottom: 12,
+                                    display: "flex",
+                                    justifyContent: msg.role === "user" ? "flex-end" : "flex-start",
+                                  }}>
+                                    <div style={{
+                                      maxWidth: "85%",
+                                      padding: "8px 14px",
+                                      borderRadius: 12,
+                                      fontSize: 14,
+                                      lineHeight: 1.55,
+                                      ...(msg.role === "user" ? {
+                                        background: "var(--accent)",
+                                        color: "white",
+                                      } : {
+                                        background: "var(--fill-secondary)",
+                                        color: "var(--text-primary)",
+                                      }),
+                                    }}>
+                                      {msg.role === "assistant" ? (
+                                        <div
+                                          className="markdown-body"
+                                          dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content || "...") }}
+                                        />
+                                      ) : (
+                                        msg.content
+                                      )}
+                                      {msg.isStreaming && (
+                                        <span style={{
+                                          display: "inline-block", width: 6, height: 14,
+                                          background: "var(--text-tertiary)", borderRadius: 1,
+                                          marginLeft: 2, animation: "blink 1s step-end infinite",
+                                        }} />
+                                      )}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Follow-up suggestions */}
+                            {chatMessages.length === 0 && (
+                              <div style={{ padding: "8px 20px 4px", display: "flex", flexWrap: "wrap", gap: 6 }}>
+                                {[
+                                  "Show me the specific changes to make",
+                                  "What's the impact of not fixing this?",
+                                  "Help me write the new topic files",
+                                ].map((q) => (
+                                  <button
+                                    key={q}
+                                    onClick={() => sendChatMessage(q)}
+                                    className="btn-ghost focus-ring"
+                                    style={{
+                                      padding: "4px 10px", borderRadius: 12,
+                                      fontSize: 11, fontWeight: 500,
+                                      background: "var(--fill-secondary)",
+                                      border: "1px solid var(--separator)",
+                                      color: "var(--text-secondary)",
+                                      cursor: "pointer", whiteSpace: "nowrap",
+                                    }}
+                                  >
+                                    {q}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+
+                            {/* Chat input */}
+                            <div style={{
+                              display: "flex", alignItems: "flex-end", gap: 8,
+                              padding: "10px 20px 16px",
+                            }}>
+                              <textarea
+                                ref={chatTextareaRef}
+                                value={chatInput}
+                                onChange={(e) => setChatInput(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && !e.shiftKey) {
+                                    e.preventDefault();
+                                    sendChatMessage();
+                                  }
+                                }}
+                                placeholder="Ask a follow-up..."
+                                disabled={chatStreaming}
+                                rows={1}
+                                style={{
+                                  flex: 1, resize: "none",
+                                  background: "var(--fill-tertiary)",
+                                  border: "1px solid var(--separator)",
+                                  borderRadius: 8,
+                                  padding: "8px 12px",
+                                  fontSize: 13,
+                                  color: "var(--text-primary)",
+                                  outline: "none",
+                                  lineHeight: 1.4,
+                                  fontFamily: "inherit",
+                                }}
+                              />
+                              <button
+                                onClick={() => sendChatMessage()}
+                                disabled={chatStreaming || !chatInput.trim()}
+                                className="btn-ghost focus-ring"
+                                style={{
+                                  padding: "8px 14px",
+                                  borderRadius: 8,
+                                  fontSize: 13,
+                                  fontWeight: 600,
+                                  background: "var(--accent)",
+                                  color: "white",
+                                  border: "none",
+                                  cursor: chatStreaming || !chatInput.trim() ? "not-allowed" : "pointer",
+                                  opacity: chatStreaming || !chatInput.trim() ? 0.5 : 1,
+                                }}
+                              >
+                                Send
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Stale daily logs */}
+                {health && health.staleDailyLogs.length > 0 && (
+                  <div style={{ marginBottom: "var(--space-4)" }}>
+                    <StaleDailyLogsCard health={health} />
                   </div>
                 )}
 
@@ -1548,6 +2671,10 @@ export default function MemoryPage() {
                       sortedFiles.map((file) => {
                         const isActive = selected?.path === file.path;
                         const json = isJsonFile(file);
+                        const matches = search ? contentMatchCount(file.content, search) : 0;
+                        const nameMatch = search
+                          ? file.label.toLowerCase().includes(q) || file.relativePath.toLowerCase().includes(q)
+                          : true;
                         return (
                           <button
                             key={file.path}
@@ -1585,16 +2712,37 @@ export default function MemoryPage() {
                                   {file.label}
                                 </span>
                                 <CategoryBadge category={file.category} />
+                                {health && (
+                                  <HealthBadge
+                                    severity={fileHealthSeverity(file, health.checks)}
+                                  />
+                                )}
                               </div>
                               <div
-                                style={{
-                                  fontSize: "var(--text-caption2)",
-                                  color: "var(--text-tertiary)",
-                                  marginTop: 2,
-                                }}
+                                className="flex items-center justify-between"
+                                style={{ marginTop: 2 }}
                               >
-                                {formatBytes(file.sizeBytes)} {"\u00b7"}{" "}
-                                {timeAgo(file.lastModified)}
+                                <span
+                                  style={{
+                                    fontSize: "var(--text-caption2)",
+                                    color: "var(--text-tertiary)",
+                                  }}
+                                >
+                                  {formatBytes(file.sizeBytes)} {"\u00b7"}{" "}
+                                  {timeAgo(file.lastModified)}
+                                </span>
+                                {search && matches > 0 && !nameMatch && (
+                                  <span
+                                    style={{
+                                      fontSize: "var(--text-caption2)",
+                                      color: "var(--text-tertiary)",
+                                      flexShrink: 0,
+                                      marginLeft: "var(--space-2)",
+                                    }}
+                                  >
+                                    {matches} match{matches !== 1 ? "es" : ""}
+                                  </span>
+                                )}
                               </div>
                             </div>
                           </button>
@@ -1683,6 +2831,18 @@ export default function MemoryPage() {
                                 ))}
                               </span>
                               <CategoryBadge category={selected.category} />
+                              {isDirty && (
+                                <span
+                                  style={{
+                                    width: 6,
+                                    height: 6,
+                                    borderRadius: "50%",
+                                    background: "var(--system-orange)",
+                                    flexShrink: 0,
+                                  }}
+                                  title="Unsaved changes"
+                                />
+                              )}
                             </div>
 
                             {/* Metadata */}
@@ -1712,53 +2872,210 @@ export default function MemoryPage() {
                             className="flex items-center flex-shrink-0"
                             style={{ gap: "var(--space-2)" }}
                           >
-                            <button
-                              onClick={copyContent}
-                              className="btn-ghost focus-ring"
-                              aria-label="Copy file content"
-                              style={{
-                                padding: "6px 12px",
-                                borderRadius: "var(--radius-sm)",
-                                fontSize: "var(--text-caption1)",
-                                fontWeight: "var(--weight-medium)",
-                                display: "inline-flex",
-                                alignItems: "center",
-                                gap: 4,
-                              }}
-                            >
-                              {copied ? <Check size={14} /> : <Copy size={14} />}
-                              {copied ? "Copied" : "Copy"}
-                            </button>
-                            <button
-                              onClick={downloadContent}
-                              className="btn-ghost focus-ring"
-                              aria-label="Download file"
-                              style={{
-                                padding: "6px 12px",
-                                borderRadius: "var(--radius-sm)",
-                                fontSize: "var(--text-caption1)",
-                                fontWeight: "var(--weight-medium)",
-                                display: "inline-flex",
-                                alignItems: "center",
-                                gap: 4,
-                              }}
-                            >
-                              <Download size={14} />
-                              Download
-                            </button>
+                            {isEditing ? (
+                              <>
+                                <button
+                                  onClick={cancelEditing}
+                                  className="btn-ghost focus-ring"
+                                  style={{
+                                    padding: "6px 12px",
+                                    borderRadius: "var(--radius-sm)",
+                                    fontSize: "var(--text-caption1)",
+                                    fontWeight: "var(--weight-medium)",
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 4,
+                                  }}
+                                >
+                                  <X size={14} />
+                                  Cancel
+                                </button>
+                                <button
+                                  onClick={saveContent}
+                                  disabled={saving || !isDirty}
+                                  className="focus-ring"
+                                  style={{
+                                    padding: "6px 12px",
+                                    borderRadius: "var(--radius-sm)",
+                                    fontSize: "var(--text-caption1)",
+                                    fontWeight: "var(--weight-medium)",
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 4,
+                                    background: "var(--accent)",
+                                    color: "white",
+                                    border: "none",
+                                    cursor: saving || !isDirty ? "not-allowed" : "pointer",
+                                    opacity: saving || !isDirty ? 0.5 : 1,
+                                  }}
+                                >
+                                  <Save size={14} />
+                                  {saving ? "Saving..." : "Save"}
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  onClick={copyContent}
+                                  className="btn-ghost focus-ring"
+                                  aria-label="Copy file content"
+                                  style={{
+                                    padding: "6px 12px",
+                                    borderRadius: "var(--radius-sm)",
+                                    fontSize: "var(--text-caption1)",
+                                    fontWeight: "var(--weight-medium)",
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 4,
+                                  }}
+                                >
+                                  {copied ? <Check size={14} /> : <Copy size={14} />}
+                                  {copied ? "Copied" : "Copy"}
+                                </button>
+                                <button
+                                  onClick={downloadContent}
+                                  className="btn-ghost focus-ring"
+                                  aria-label="Download file"
+                                  style={{
+                                    padding: "6px 12px",
+                                    borderRadius: "var(--radius-sm)",
+                                    fontSize: "var(--text-caption1)",
+                                    fontWeight: "var(--weight-medium)",
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 4,
+                                  }}
+                                >
+                                  <Download size={14} />
+                                  Download
+                                </button>
+                                <button
+                                  onClick={startEditing}
+                                  className="btn-ghost focus-ring"
+                                  aria-label="Edit file"
+                                  style={{
+                                    padding: "6px 12px",
+                                    borderRadius: "var(--radius-sm)",
+                                    fontSize: "var(--text-caption1)",
+                                    fontWeight: "var(--weight-medium)",
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    gap: 4,
+                                  }}
+                                >
+                                  <Pencil size={14} />
+                                  Edit
+                                </button>
+                                {showReindex && (
+                                  <ReindexButton
+                                    status={reindexStatus}
+                                    onReindex={handleReindex}
+                                  />
+                                )}
+                              </>
+                            )}
                           </div>
                         </div>
                       </div>
 
+                      {/* Unsaved changes prompt when switching files */}
+                      {pendingFile && (
+                        <div
+                          style={{
+                            padding: "var(--space-2) var(--space-6)",
+                            background: "var(--system-orange)",
+                            color: "white",
+                            fontSize: "var(--text-caption1)",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: "var(--space-2)",
+                          }}
+                        >
+                          <span>Unsaved changes</span>
+                          <div className="flex items-center" style={{ gap: "var(--space-2)" }}>
+                            <button
+                              onClick={saveContent}
+                              disabled={saving}
+                              style={{
+                                padding: "2px 8px",
+                                borderRadius: "var(--radius-sm)",
+                                background: "rgba(255,255,255,0.2)",
+                                color: "white",
+                                border: "none",
+                                fontSize: "var(--text-caption1)",
+                                cursor: "pointer",
+                              }}
+                            >
+                              {saving ? "Saving..." : "Save"}
+                            </button>
+                            <button
+                              onClick={discardAndSwitch}
+                              style={{
+                                padding: "2px 8px",
+                                borderRadius: "var(--radius-sm)",
+                                background: "rgba(255,255,255,0.2)",
+                                color: "white",
+                                border: "none",
+                                fontSize: "var(--text-caption1)",
+                                cursor: "pointer",
+                              }}
+                            >
+                              Discard
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
                       {/* Scrollable content area */}
                       <div
+                        ref={contentRef}
                         className="flex-1 overflow-y-auto"
                         style={{
                           padding: "var(--space-8) var(--space-10)",
                         }}
                       >
                         <div style={{ maxWidth: 760, margin: "0 auto" }}>
-                          {renderedContent}
+                          {isEditing ? (
+                            <>
+                              <textarea
+                                value={editingContent ?? ""}
+                                onChange={(e) => setEditingContent(e.target.value)}
+                                className="font-mono"
+                                style={{
+                                  width: "100%",
+                                  minHeight: 400,
+                                  resize: "vertical",
+                                  background: "var(--code-bg)",
+                                  color: "var(--code-text)",
+                                  border: "1px solid var(--code-border)",
+                                  borderRadius: "var(--radius-md)",
+                                  padding: "var(--space-4)",
+                                  fontSize: "var(--text-footnote)",
+                                  lineHeight: "var(--leading-relaxed)",
+                                  outline: "none",
+                                  fontFamily: "var(--font-mono, ui-monospace, monospace)",
+                                }}
+                              />
+                              {saveError && (
+                                <div
+                                  style={{
+                                    marginTop: "var(--space-2)",
+                                    padding: "var(--space-2) var(--space-3)",
+                                    borderRadius: "var(--radius-sm)",
+                                    background: "var(--system-red)",
+                                    color: "white",
+                                    fontSize: "var(--text-caption1)",
+                                  }}
+                                >
+                                  {saveError}
+                                </div>
+                              )}
+                              <EditingHintsPanel hints={editingHints} />
+                            </>
+                          ) : (
+                            renderedContent
+                          )}
                         </div>
                       </div>
                     </>
@@ -1840,6 +3157,26 @@ export default function MemoryPage() {
           .guide-config-grid {
             grid-template-columns: 1fr !important;
           }
+        }
+        @media (min-width: 641px) and (max-width: 1023px) {
+          .overview-cards-grid {
+            grid-template-columns: repeat(2, 1fr) !important;
+          }
+        }
+        @keyframes spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.4; }
+        }
+        @keyframes shimmer {
+          0%, 100% { opacity: 0.3; }
+          50% { opacity: 0.6; }
+        }
+        @keyframes blink {
+          50% { opacity: 0; }
         }
       `}</style>
     </div>

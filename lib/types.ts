@@ -225,11 +225,47 @@ export interface MemoryStats {
   dailyTimeline: Array<{ date: string; sizeBytes: number } | null>
 }
 
+// ── Memory Health Types ──────────────────────────────────────
+
+export type HealthSeverity = 'critical' | 'warning' | 'info' | 'ok'
+
+export interface MemoryHealthCheck {
+  id: string
+  severity: HealthSeverity
+  title: string
+  description: string
+  affectedFiles: string[] | null
+  action: string | null
+}
+
+export interface MemoryHealthSummary {
+  score: number
+  checks: MemoryHealthCheck[]
+  staleDailyLogs: StaleDailyLogInfo[]
+}
+
+export interface StaleDailyLogInfo {
+  relativePath: string
+  label: string
+  date: string
+  ageDays: number
+  sizeBytes: number
+}
+
+export type ReindexStatus = 'idle' | 'running' | 'success' | 'failed' | 'unavailable'
+
+export interface EditingHint {
+  id: string
+  text: string
+  severity: 'tip' | 'warning'
+}
+
 export interface MemoryApiResponse {
   files: MemoryFileInfo[]
   config: MemoryConfig
   status: MemoryStatus
   stats: MemoryStats
+  health: MemoryHealthSummary
 }
 
 // ── Activity Console Types ─────────────────────────────────────
