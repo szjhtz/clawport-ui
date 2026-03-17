@@ -3,6 +3,7 @@ import { execSync } from 'child_process'
 import { join, basename } from 'path'
 import bundledRegistry from '@/lib/agents.json'
 import type { Agent } from '@/lib/types'
+import { extractJson } from '@/lib/cli-utils'
 
 /** Raw agent data from JSON (everything except runtime-loaded soul and crons) */
 export type AgentEntry = Omit<Agent, 'soul' | 'crons'>
@@ -441,7 +442,7 @@ export function listCliAgents(openclawBin: string): CliAgentEntry[] | null {
       encoding: 'utf-8',
       timeout: 10000,
     })
-    const parsed = JSON.parse(raw)
+    const parsed = extractJson(raw)
     const agents: unknown[] = Array.isArray(parsed) ? parsed : []
     if (agents.length === 0) return null
     return agents as CliAgentEntry[]
