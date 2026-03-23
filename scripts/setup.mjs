@@ -45,7 +45,19 @@ function exec(cmd) {
 function detectWorkspacePath() {
   const base = join(homedir(), '.openclaw')
 
-  // 1. Current agent-scoped layout
+  // 1. Read from openclaw.json (canonical source)
+  const configPath = join(base, 'openclaw.json')
+  if (existsSync(configPath)) {
+    try {
+      const config = JSON.parse(readFileSync(configPath, 'utf-8'))
+      const ws = config?.agents?.defaults?.workspace
+      if (typeof ws === 'string' && existsSync(ws)) return ws
+    } catch {
+      // Invalid JSON, fall through
+    }
+  }
+
+  // 2. Current agent-scoped layout
   const agentPath = join(base, 'agents', 'main', 'workspace')
   if (existsSync(agentPath)) return agentPath
 

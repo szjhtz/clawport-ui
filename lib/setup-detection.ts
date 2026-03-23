@@ -21,15 +21,28 @@ import { execSync } from 'child_process'
  * Detect the default workspace path.
  *
  * Checks in order:
- *   1. ~/.openclaw/agents/main/workspace  (current agent-scoped layout)
- *   2. ~/.openclaw/workspace-main         (multi-agent layout, main agent)
- *   3. ~/.openclaw/workspace-*            (multi-agent layout, any agent)
- *   4. ~/.openclaw/workspace              (legacy single-workspace layout)
+ *   1. ~/.openclaw/openclaw.json agents.defaults.workspace (canonical)
+ *   2. ~/.openclaw/agents/main/workspace  (current agent-scoped layout)
+ *   3. ~/.openclaw/workspace-main         (multi-agent layout, main agent)
+ *   4. ~/.openclaw/workspace-*            (multi-agent layout, any agent)
+ *   5. ~/.openclaw/workspace              (legacy single-workspace layout)
  */
 export function detectWorkspacePath(): string | null {
   const base = join(homedir(), '.openclaw')
 
-  // 1. Current agent-scoped layout
+  // 1. Read from openclaw.json (canonical source)
+  const configPath = join(base, 'openclaw.json')
+  if (existsSync(configPath)) {
+    try {
+      const config = JSON.parse(readFileSync(configPath, 'utf-8'))
+      const ws = config?.agents?.defaults?.workspace
+      if (typeof ws === 'string' && existsSync(ws)) return ws
+    } catch {
+      // Invalid JSON, fall through
+    }
+  }
+
+  // 2. Current agent-scoped layout
   const agentPath = join(base, 'agents', 'main', 'workspace')
   if (existsSync(agentPath)) return agentPath
 
